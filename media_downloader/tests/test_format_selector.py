@@ -268,6 +268,25 @@ class TestMuxPath:
 
 
 # ---------------------------------------------------------------------------
+# Single direct-download fallback
+# ---------------------------------------------------------------------------
+
+
+class TestSingleDirectFormatSelection:
+    def test_selects_single_direct_format_when_present(self) -> None:
+        fmt = Format(
+            format_id="direct",
+            url="https://example.com/image.jpg",
+            stream_type=StreamType.VIDEO_ONLY,
+            container="jpeg",
+        )
+        manifest = _manifest(fmt)
+        result = SELECTOR.select(manifest, _opts())
+        assert result.video is fmt
+        assert result.audio is None
+
+
+# ---------------------------------------------------------------------------
 # NoSuitableFormatFound
 # ---------------------------------------------------------------------------
 

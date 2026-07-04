@@ -6,6 +6,7 @@ Public API surface (expanded as components are implemented):
 """
 
 from media_downloader.extractors.generic import GenericHTTPExtractor
+from media_downloader.extractors.web import WebPageExtractor
 from media_downloader.models import (
     # Enums / discriminated unions
     StreamType,
@@ -69,6 +70,7 @@ __all__ = [
     "FormatIdNotFound",
     "ProcessingFailed",
     "GenericHTTPExtractor",
+    "WebPageExtractor",
     "Orchestrator",
     "create_orchestrator",
 ]

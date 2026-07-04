@@ -247,5 +247,31 @@ class FormatSelector:
             best_audio = max(audio_only, key=self._audio_score)
             return SelectedFormats(video=best_video, audio=best_audio)
 
+        if len(candidates) == 1:
+            fmt = candidates[0]
+            if fmt.format_id == "direct":
+                return SelectedFormats(video=fmt, audio=None)
+            available_heights = [fmt.height]
+            raise NoSuitableFormatFound(available_heights)
+
+        if video_only:
+            best = max(video_only, key=lambda f: self._quality_score(f, opts))
+            return SelectedFormats(video=best, audio=None)
+
+        if audio_only:
+            best = max(audio_only, key=self._audio_score)
+            return SelectedFormats(video=None, audio=best)
+
+        available_heights = [f.height for f in candidates]
+        raise NoSuitableFormatFound(available_heights)
+
+        if video_only:
+            best = max(video_only, key=lambda f: self._quality_score(f, opts))
+            return SelectedFormats(video=best, audio=None)
+
+        if audio_only:
+            best = max(audio_only, key=self._audio_score)
+            return SelectedFormats(video=None, audio=best)
+
         available_heights = [f.height for f in candidates]
         raise NoSuitableFormatFound(available_heights)

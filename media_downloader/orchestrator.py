@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Callable, List, Optional
 
 from media_downloader.download_manager import DownloadManager
+from media_downloader.extractors.web import WebPageExtractor
 from media_downloader.format_selector import FormatSelector
 from media_downloader.models import (
     DownloadError,
@@ -21,7 +22,7 @@ from media_downloader.output_resolver import OutputPathResolver
 from media_downloader.post_processor import PostProcessor
 from media_downloader.registry import ExtractorRegistry
 from media_downloader.extractors.generic import GenericHTTPExtractor
-from media_downloader.progress import ProgressReporter
+from media_downloader.progress import ConsoleProgressReporter, ProgressReporter
 
 
 class Orchestrator:
@@ -41,7 +42,12 @@ class Orchestrator:
         self._output_resolver = output_resolver or OutputPathResolver()
         self._post_processor = post_processor or PostProcessor()
 
-    def download(self, url: str, opts: DownloadOptions) -> DownloadResult:
+    def download(
+        self,
+        url: str,
+        opts: DownloadOptions,
+        progress_reporter: Optional[ProgressReporter] = None,
+    ) -> DownloadResult:
         extractor = self._registry.resolve(url)
         if extractor is None:
             raise NoExtractorFound(url)
@@ -52,7 +58,8 @@ class Orchestrator:
         output_dir.mkdir(parents=True, exist_ok=True)
         final_path = self._output_resolver.resolve(opts.output_template, manifest, output_dir)
 
-        downloaded = self._download_manager.download(selected, final_path.parent, opts)
+        reporter = progress_reporter or ConsoleProgressReporter()
+        downloaded = self._download_manager.download(selected, final_path.parent, opts, reporter)
         final_file = self._post_processor.process(downloaded)
         return DownloadResult(
             final_path=final_file.path,
@@ -68,5 +75,6 @@ class Orchestrator:
 
 def create_orchestrator() -> Orchestrator:
     registry = ExtractorRegistry()
+    registry.register(WebPageExtractor())
     registry.register(GenericHTTPExtractor())
     return Orchestrator(registry=registry)

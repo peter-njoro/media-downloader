@@ -71,9 +71,6 @@ class DownloadManager:
                 response = client.get(url, headers=headers, follow_redirects=True)
                 if response.status_code not in {200, 206}:
                     raise HTTPError(url, response.status_code)
-                mode = "ab" if offset > 0 else "wb"
-                with temp_path.open(mode, encoding="utf-8") as handle:
-                    handle.close()
                 with temp_path.open("ab" if offset > 0 else "wb") as handle:
                     written = offset
                     for chunk in response.iter_bytes(chunk_size=8192):
@@ -85,7 +82,7 @@ class DownloadManager:
                         written += len(chunk)
                         self._resume_store.update(url, written, response.headers.get("content-length"))
                         if on_progress is not None:
-                            on_progress.on_progress(written, None)
+                            on_progress.on_progress(written, total_size=None)
                         if opts.rate_limit:
                             time.sleep(len(chunk) / opts.rate_limit)
         except httpx.HTTPError as exc:

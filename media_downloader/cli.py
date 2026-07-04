@@ -9,6 +9,7 @@ import click
 
 from media_downloader.models import Best, DownloadOptions, FormatId, Height, QualitySpec, Worst
 from media_downloader.orchestrator import create_orchestrator
+from media_downloader.progress import ConsoleProgressReporter
 
 
 @click.command()
@@ -35,7 +36,7 @@ def main(url: str, quality: str, audio_only: bool, audio_format: Optional[str], 
         concurrent_fragments=concurrent_fragments,
     )
     try:
-        result = create_orchestrator().download(url, opts)
+        result = create_orchestrator().download(url, opts, progress_reporter=ConsoleProgressReporter())
     except Exception as exc:  # pragma: no cover - simple CLI wrapper
         click.echo(str(exc), err=True)
         raise SystemExit(1) from exc
