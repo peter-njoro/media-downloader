@@ -5,7 +5,7 @@
 
 The media downloader is a CLI tool and reusable library for downloading video and audio files from internet sources (web pages, streaming platforms, direct media URLs). Given a URL, the tool identifies the media host, extracts available media streams and formats, selects the best match against user-specified quality constraints, downloads the stream(s), optionally merges video and audio tracks, and writes the final file to disk. The system is designed to be extensible: new platform extractors can be added without changing core download or merge logic.
 
-The tool exposes both a command-line interface for end users and a programmatic API for integration into other applications. It supports resuming interrupted downloads, progress reporting, format selection, post-processing (audio extraction, remuxing), and configurable output naming. In addition to direct media URLs, the default extractor pipeline includes a lightweight web scraper for static HTML pages that surfaces media links embedded in the page. For JavaScript-heavy pages where media is loaded dynamically, an optional Playwright-based extractor can render the page in a headless browser and discover media through both DOM inspection and network request interception.
+The tool exposes both a command-line interface for end users and a programmatic API for integration into other applications. It supports resuming interrupted downloads, progress reporting, format selection, post-processing (audio extraction, remuxing), and configurable output naming. In addition to direct media URLs, the default extractor pipeline includes a lightweight web scraper for static HTML pages that surfaces media links embedded in the page. For JavaScript-heavy pages where media is loaded dynamically, an optional Playwright-based extractor can render the page in a headless browser and discover media through both DOM inspection and network request interception. The system also includes an optional AI layer that can reverse-engineer obfuscated media URLs, analyze downloaded content (transcription, summarization, thumbnails), and recommend optimal formats based on content type — all behind an abstract provider interface supporting OpenAI, Anthropic, and Ollama.
 
 ## Architecture
 
@@ -34,7 +34,15 @@ graph TD
 
     FS --> FM[Format Manifest]
 
-    EX1B --> PB[Playwright / Headless Browser]
+    EX1B --> PW[Playwright / Headless Browser]
+
+    Core --> AIV[AI Provider Layer]
+    AIV --> AIE[AI Extractor]
+    AIV --> QA[Quality Advisor]
+    Core --> CA[Content Analyzer]
+    AIE --> LLM[LLM Backend]
+    CA --> LLM
+    QA --> LLM
 ```
 
 ## Sequence Diagrams
@@ -116,6 +124,67 @@ sequenceDiagram
     Page-->>JSExtractor: title, description, thumbnail
     JSExtractor->>JSExtractor: merge + deduplicate URLs
     JSExtractor-->>Orchestrator: MediaManifest
+```
+
+### AI-Assisted Extraction Flow
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Orchestrator
+    participant Extractor
+    participant AIExtractor
+    participant AIProvider
+    participant LLM
+
+    User->>Orchestrator: download(url, opts{ai_extract: true})
+    Orchestrator->>Extractor: extract(url)
+    Extractor-->>Orchestrator: Err(ExtractionFailed)
+    Orchestrator->>AIExtractor: extractWithAI(url)
+    AIExtractor->>AIExtractor: fetchPageSource(url)
+    AIExtractor->>AIProvider: chat(messages=[system_prompt, page_source])
+    AIProvider->>LLM: POST /chat/completions
+    LLM-->>AIProvider: {urls: [...]}
+    AIProvider-->>AIExtractor: structured response
+    AIExtractor->>AIExtractor: parseURLs(response)
+    AIExtractor->>AIExtractor: normalize + filter
+    AIExtractor-->>Orchestrator: MediaManifest
+```
+
+### AI Content Analysis Flow
+
+```mermaid
+sequenceDiagram
+    participant Orchestrator
+    participant PostProcessor
+    participant ContentAnalyzer
+    participant AIProvider
+    participant LLM
+
+    Orchestrator->>PostProcessor: process(downloaded_files)
+    PostProcessor-->>Orchestrator: DownloadResult
+    Orchestrator->>ContentAnalyzer: analyze(result.files, opts)
+    alt Transcription
+        ContentAnalyzer->>ContentAnalyzer: extractAudio(file, ffmpeg)
+        ContentAnalyzer->>AIProvider: transcribe(audio_data)
+        AIProvider->>LLM: POST /audio/transcriptions
+        LLM-->>AIProvider: transcript text
+        AIProvider-->>ContentAnalyzer: transcription
+    end
+    alt Summarization
+        ContentAnalyzer->>AIProvider: chat(transcription_prompt)
+        AIProvider->>LLM: POST /chat/completions
+        LLM-->>AIProvider: summary text
+        AIProvider-->>ContentAnalyzer: summary
+    end
+    alt Thumbnails
+        ContentAnalyzer->>ContentAnalyzer: extractFrames(file, ffmpeg)
+        ContentAnalyzer->>AIProvider: analyzeImage(frames, selection_prompt)
+        AIProvider->>LLM: POST /chat/completions (multimodal)
+        LLM-->>AIProvider: best frame index
+        AIProvider-->>ContentAnalyzer: selected thumbnails
+    end
+    ContentAnalyzer-->>Orchestrator: AIAnalysisResult
 ```
 
 ## Components and Interfaces
@@ -312,6 +381,138 @@ GenericHTTPExtractor   (direct media URLs)
 - Sanitize resulting filename for the target OS
 - Ensure no path collisions (append index if needed)
 
+---
+
+### Component 8: AI Provider Abstraction
+
+**Purpose**: Abstract interface for communicating with LLM backends. Supports multiple providers behind a uniform interface, with lazy SDK imports so that AI features are only loaded when explicitly enabled.
+
+**Interface**:
+```math
+\begin{aligned}
+&\text{AIProvider} : \{\\
+&\quad \text{chat} : \text{List(Message)} \times \text{Option(String)} \rightarrow \text{String}\\
+&\quad \text{analyzeImage} : \text{Path} \times \text{String} \rightarrow \text{String}\\
+&\}
+\end{aligned}
+```
+
+**AIConfig**:
+```math
+\begin{aligned}
+&\text{AIConfig} : \{\\
+&\quad \text{provider} : \text{String} \quad // "openai" | "anthropic" | "ollama"\\
+&\quad \text{model} : \text{Option(String)}\\
+&\quad \text{api\_key} : \text{Option(String)}\\
+&\quad \text{base\_url} : \text{Option(String)}\\
+&\quad \text{max\_tokens} : \mathbb{N}\\
+&\quad \text{temperature} : \mathbb{R}\\
+&\}
+\end{aligned}
+```
+
+**Provider Implementations**:
+- **OpenAIProvider**: Uses `openai` SDK. Sends chat completions to `POST /v1/chat/completions`. Image analysis via `gpt-4o` multimodal endpoint.
+- **AnthropicProvider**: Uses `anthropic` SDK. Sends messages to `POST /v1/messages`. Image analysis via native multimodal support.
+- **OllamaProvider**: Uses `ollama` Python client or raw HTTP to `localhost:11434`. Chat via `/api/chat`. Image analysis via `/api/chat` with images field.
+- **Factory**: `create_provider(config) -> AIProvider` — dispatches on `config.provider` string, validates credentials, raises `AIConfigError` on unknown provider.
+
+**Responsibilities**:
+- Manage authentication (API keys, OAuth tokens)
+- Construct provider-specific request payloads from generic message format
+- Parse provider-specific responses into plain text
+- Retry with exponential backoff on transient errors (429, 503)
+- Enforce token budget (`max_tokens`) per request
+
+---
+
+### Component 9: AI Extractor
+
+**Purpose**: Fallback extractor that uses an LLM to reverse-engineer obfuscated media URLs from page source. Invoked by the orchestrator when standard extraction fails and `opts.ai_extract` is `True`.
+
+**Interface**:
+```math
+\begin{aligned}
+&\text{AIExtractor} : \{\\
+&\quad \text{can\_handle} : \text{URL} \rightarrow \mathbf{false}\\
+&\quad \text{extractWithAI} : \text{URL} \rightarrow \text{Result}(\text{MediaManifest}, \text{ExtractionError})\\
+&\}
+\end{aligned}
+```
+
+**Responsibilities**:
+- Fetch the full page source (HTML or rendered DOM) from the target URL
+- Construct a structured prompt requesting JSON-formatted media URL list with metadata (quality, container, codec, type)
+- Send prompt to AIProvider.chat() and parse the response
+- Validate each returned URL against `_looks_like_media()` predicates
+- Normalize valid URLs through the existing URL normalization pipeline
+- Build and return a `MediaManifest` from the extracted candidates
+- Return `ExtractionError` if the LLM produces no valid URLs
+
+---
+
+### Component 10: Content Analyzer
+
+**Purpose**: Post-download content analysis using AI. Extracts audio for transcription, generates summaries, and selects representative thumbnails.
+
+**Interface**:
+```math
+\begin{aligned}
+&\text{ContentAnalyzer} : \{\\
+&\quad \text{analyze} : \text{DownloadedFiles} \times \text{DownloadOptions} \rightarrow \text{AIAnalysisResult}\\
+&\}
+\end{aligned}
+```
+
+**Analysis Modes** (each independently opt-in via `DownloadOptions` flags):
+
+| Mode | Flag | Input | Output | Provider Method |
+|------|------|-------|--------|----------------|
+| Transcription | `ai_transcribe` | Audio track (extracted via FFmpeg) | SRT/VTT text | STT endpoint or local Whisper |
+| Summarization | `ai_summarize` | Transcription text | Markdown summary | `chat()` with summarization prompt |
+| Thumbnails | `ai_thumbnails` | Video file | List of JPEG paths | Frame extraction (FFmpeg) + optional multimodal selection |
+
+**Responsibilities**:
+- Extract audio track from video using FFmpeg (if transcription requested)
+- Chunk large audio files for STT API limits (25 MB per request)
+- Generate SRT-format captions with timestamps
+- Summarize transcript into structured markdown (key points, sections)
+- Extract representative frames at uniform intervals using FFmpeg
+- Optionally use multimodal LLM to select the most representative frame
+- Return partial results if any individual mode fails (graceful degradation)
+
+---
+
+### Component 11: Quality Advisor
+
+**Purpose**: Content-aware quality selection using AI. Classifies content type from manifest metadata and recommends the optimal format for that content.
+
+**Interface**:
+```math
+\begin{aligned}
+&\text{QualityAdvisor} : \{\\
+&\quad \text{advise} : \text{MediaManifest} \times \text{AIConfig} \rightarrow \text{AIQualityAdvice}\\
+&\}
+\end{aligned}
+```
+
+**Content Type Classification**:
+
+| Content Type | Heuristic Signals | Recommended Format |
+|---|---|---|
+| `lecture` | Duration > 20 min, educational keywords in title/description | 720p video + highest bitrate audio |
+| `music_video` | Duration 2-8 min, music-related keywords | Max resolution video + max bitrate audio |
+| `podcast` | Audio-only streams present, duration > 15 min | Audio-only (best bitrate) |
+| `short_clip` | Duration < 60 s | Combined video+audio at moderate quality |
+| `archival` | No strong signals, or user explicitly requests | Max resolution + max bitrate everything |
+
+**Responsibilities**:
+- Build a metadata summary from the manifest (durations, available resolutions, audio tracks, title, description)
+- Send classification prompt to LLM with content signals
+- Parse LLM response into content type and recommended format ID
+- Fall back to `BestQualitySpec` if LLM fails or content type is ambiguous
+- Cache recommendations for the same URL within a session
+
 ## Data Models
 
 ### Model 1: MediaManifest
@@ -373,7 +574,7 @@ User-supplied configuration for a download request.
 ```math
 \begin{aligned}
 &\text{DownloadOptions} = \{\\
-&\quad \text{quality} : \text{QualitySpec}, \quad \text{QualitySpec} = \text{Best} | \text{Worst} | \text{Height}(\mathbb{N}) | \text{FormatId}(\text{String})\\
+&\quad \text{quality} : \text{QualitySpec}, \quad \text{QualitySpec} = \text{Best} | \text{Worst} | \text{Height}(\mathbb{N}) | \text{FormatId}(\text{String}) | \text{AIRecommended}\\
 &\quad \text{audioOnly} : \mathbb{B},\\
 &\quad \text{audioFormat} : \text{Option}(\text{String}), \quad \text{// e.g. "mp3", "m4a"}\\
 &\quad \text{outputTemplate} : \text{OutputTemplate},\\
@@ -382,7 +583,13 @@ User-supplied configuration for a download request.
 &\quad \text{retries} : \mathbb{N},\\
 &\quad \text{resume} : \mathbb{B},\\
 &\quad \text{concurrentFragments} : \mathbb{N},\\
-&\quad \text{jsRender} : \mathbb{B} \quad \text{// use Playwright for JS-rendered pages}\\
+&\quad \text{jsRender} : \mathbb{B}, \quad \text{// use Playwright for JS-rendered pages}\\
+&\quad \text{aiExtract} : \mathbb{B}, \quad \text{// use AI to reverse-engineer obfuscated media URLs}\\
+&\quad \text{aiQuality} : \mathbb{B}, \quad \text{// use AI to select optimal format for content type}\\
+&\quad \text{aiAnalyze} : \mathbb{B}, \quad \text{// run all AI content analysis after download}\\
+&\quad \text{aiTranscribe} : \mathbb{B}, \quad \text{// generate SRT captions via speech-to-text}\\
+&\quad \text{aiSummarize} : \mathbb{B}, \quad \text{// generate a text summary}\\
+&\quad \text{aiThumbnails} : \mathbb{B} \quad \text{// generate representative thumbnails}\\
 &\}
 \end{aligned}
 ```
@@ -418,7 +625,8 @@ Final outcome of a completed download operation.
 &\quad \text{manifest} : \text{MediaManifest},\\
 &\quad \text{selectedFormats} : \text{SelectedFormats},\\
 &\quad \text{bytesDownloaded} : \mathbb{N},\\
-&\quad \text{durationMs} : \mathbb{N}\\
+&\quad \text{durationMs} : \mathbb{N},\\
+&\quad \text{analysis} : \text{Option}(\text{AIAnalysisResult})\\
 &\}
 \end{aligned}
 ```
@@ -438,6 +646,59 @@ Persisted state enabling interrupted downloads to continue.
 &\quad \text{totalSize} : \text{Option}(\mathbb{N}),\\
 &\quad \text{etag} : \text{Option}(\text{String}),\\
 &\quad \text{lastModified} : \text{Option}(\text{Timestamp})\\
+&\}
+\end{aligned}
+```
+
+---
+
+### Model 7: AIConfig
+
+Configuration for connecting to an AI provider. Read from environment variables or CLI flags.
+
+```math
+\begin{aligned}
+&\text{AIConfig} = \{\\
+&\quad \text{provider} : \text{String}, \quad \text{// "openai" | "anthropic" | "ollama"}\\
+&\quad \text{model} : \text{Option}(\text{String}),\\
+&\quad \text{apiKey} : \text{Option}(\text{String}),\\
+&\quad \text{baseUrl} : \text{Option}(\text{String}),\\
+&\quad \text{maxTokens} : \mathbb{N},\\
+&\quad \text{temperature} : \mathbb{R}\\
+&\}
+\end{aligned}
+```
+
+---
+
+### Model 8: AIAnalysisResult
+
+Results from AI content analysis. Each field is optional — populated only when the corresponding analysis mode is enabled and succeeds.
+
+```math
+\begin{aligned}
+&\text{AIAnalysisResult} = \{\\
+&\quad \text{transcription} : \text{Option}(\text{String}), \quad \text{// SRT-formatted captions}\\
+&\quad \text{summary} : \text{Option}(\text{String}), \quad \text{// markdown summary}\\
+&\quad \text{thumbnails} : \text{List}(\text{Path}), \quad \text{// selected representative frames}\\
+&\quad \text{contentType} : \text{Option}(\text{String}), \quad \text{// e.g. "lecture", "music\_video"}\\
+&\quad \text{suggestedFormat} : \text{Option}(\text{String}) \quad \text{// recommended format ID}\\
+&\}
+\end{aligned}
+```
+
+---
+
+### Model 9: AIQualityAdvice
+
+Internal model returned by the Quality Advisor. Not user-facing — consumed by the Format Selector.
+
+```math
+\begin{aligned}
+&\text{AIQualityAdvice} = \{\\
+&\quad \text{contentType} : \text{String},\\
+&\quad \text{recommendedFormatId} : \text{Option}(\text{String}),\\
+&\quad \text{reasoning} : \text{String}\\
 &\}
 \end{aligned}
 ```
@@ -462,7 +723,14 @@ Persisted state enabling interrupted downloads to continue.
 &\quad \textbf{end if}\\
 &\\
 &\quad \text{manifest} \gets \text{extractor.extract}(u)\\
-&\quad \textbf{if } \text{manifest} = \text{Err}(e) \textbf{ then return } \text{Err}(\text{ExtractionFailed}(e))\\
+&\quad \textbf{if } \text{manifest} = \text{Err}(e) \textbf{ then}\\
+&\quad\quad \textbf{if } opts.\text{aiExtract} \textbf{ then}\\
+&\quad\quad\quad \text{manifest} \gets \text{aiExtractor.extractWithAI}(u)\\
+&\quad\quad \textbf{else}\\
+&\quad\quad\quad \textbf{return } \text{Err}(\text{ExtractionFailed}(e))\\
+&\quad\quad \textbf{end if}\\
+&\quad\quad \textbf{if } \text{manifest} = \text{Err}(e2) \textbf{ then return } \text{Err}(\text{ExtractionFailed}(e2))\\
+&\quad \textbf{end if}\\
 &\\
 &\quad \text{selected} \gets \text{formatSelector.select}(\text{manifest.value}, opts)\\
 &\quad \textbf{if } \text{selected} = \text{Err}(e) \textbf{ then return } \text{Err}(\text{SelectionFailed}(e))\\
@@ -475,10 +743,15 @@ Persisted state enabling interrupted downloads to continue.
 &\quad \text{final} \gets \text{postProcessor.process}(\text{files.value}, \text{toPostProcOpts}(opts))\\
 &\quad \textbf{if } \text{final} = \text{Err}(e) \textbf{ then return } \text{Err}(\text{ProcessingFailed}(e))\\
 &\\
+&\quad \text{analysis} \gets \text{None}\\
+&\quad \textbf{if } opts.\text{aiAnalyze} \textbf{ then}\\
+&\quad\quad \text{analysis} \gets \text{contentAnalyzer.analyze}(\text{final.value}, opts)\\
+&\quad \textbf{end if}\\
+&\\
 &\quad \textbf{return } \text{Ok}\Bigl(\{\\
 &\quad\quad \text{finalPath}: \text{final.value.path},\ \text{manifest}: \text{manifest.value},\\
 &\quad\quad \text{selectedFormats}: \text{selected.value},\ \text{bytesDownloaded}: \text{files.value.totalBytes},\\
-&\quad\quad \text{durationMs}: \text{elapsed}()\\
+&\quad\quad \text{durationMs}: \text{elapsed}(),\ \text{analysis}: \text{analysis}\\
 &\quad \}\Bigr)
 \end{aligned}
 ```
@@ -683,6 +956,133 @@ Persisted state enabling interrupted downloads to continue.
 \end{aligned}
 ```
 
+---
+
+### Algorithm 7: AI-Assisted Extraction
+
+```math
+\begin{aligned}
+&\textbf{algorithm } \text{extractAI} \textbf{ is}\\
+&\quad \textbf{input}: u \in \text{URL},\ src \in \text{String},\ config \in \text{AIConfig}\\
+&\quad \textbf{output}: r \in \text{Result}(\text{MediaManifest}, \text{ExtractionError})\\
+&\quad \textbf{precondition}: \text{isValidURL}(u) \land \text{providerReachable}(config)\\
+&\quad \textbf{postcondition}: r = \text{Ok}(m) \Rightarrow m.\text{formats} \neq \emptyset\\
+&\\
+&\quad \text{systemPrompt} \gets \text{"You are a media URL extraction assistant.}\\
+&\quad\quad \text{Given the following web page source, identify all media URLs"}\\
+&\quad\quad \text{(video/audio). Return JSON: \{urls: [\{url, type, quality,}\\
+&\quad\quad \text{container, codec\}\]\}. Only include playable media."}\\
+&\\
+&\quad \text{messages} \gets [\{\text{role}: \text{"system"},\ \text{content}: \text{systemPrompt}\},\\
+&\quad\quad\quad\quad\quad\ \{\text{role}: \text{"user"},\ \text{content}: \text{src}\}]\\
+&\\
+&\quad \text{response} \gets \text{config.provider.chat}(\text{messages})\\
+&\quad \textbf{if } \text{response} = \text{Err}(e) \textbf{ then return } \text{Err}(\text{AIFailure}(e))\\
+&\\
+&\quad \text{candidates} \gets \text{parseJSON}(\text{response.value})\\
+&\quad \textbf{if } \text{candidates} = \text{None} \textbf{ then return } \text{Err}(\text{ParseError}(\text{"unparseable AI response"}))\\
+&\\
+&\quad \text{valid} \gets \text{filter}(\text{candidates},\ \lambda c.\ \text{\_looks\_like\_media}(c.\text{url}))\\
+&\quad \textbf{if } |\text{valid}| = 0 \textbf{ then return } \text{Err}(\text{ExtractionError}(\text{"no valid media URLs found"}))\\
+&\\
+&\quad \text{normalized} \gets \text{map}(\text{valid},\ \lambda c.\ \text{normalizeToFormat}(c))\\
+&\quad \textbf{return } \text{Ok}\Bigl(\{\\
+&\quad\quad \text{id}: \text{generateId}(u),\ \text{sourceUrl}: u,\\
+&\quad\quad \text{title}: \text{extractTitle}(\text{src}),\\
+&\quad\quad \text{formats}: \text{normalized},\\
+&\quad\quad \text{duration}: \text{None}\\
+&\quad \}\Bigr)
+\end{aligned}
+```
+
+---
+
+### Algorithm 8: Content-Aware Quality Scoring
+
+```math
+\begin{aligned}
+&\textbf{algorithm } \text{adviseQuality} \textbf{ is}\\
+&\quad \textbf{input}: m \in \text{MediaManifest},\ config \in \text{AIConfig}\\
+&\quad \textbf{output}: a \in \text{AIQualityAdvice}\\
+&\quad \textbf{precondition}: m.\text{formats} \neq \emptyset\\
+&\\
+&\quad \text{metadata} \gets \text{buildMetadataSummary}(m)\\
+&\quad\quad \text{// includes: title, description, duration, available resolutions,}\\
+&\quad\quad \text{// available audio bitrates, container types}\\
+&\\
+&\quad \text{prompt} \gets \text{"Classify this media content type and recommend}\\
+&\quad\quad \text{optimal format. Content types: lecture, music\_video, podcast,}\\
+&\quad\quad \text{short\_clip, archival. Return JSON: \{content\_type,}\\
+&\quad\quad \text{recommended\_format\_id, reasoning\}. Metadata: " } \cup \text{metadata}\\
+&\\
+&\quad \text{messages} \gets [\{\text{role}: \text{"system"},\ \text{content}: \text{prompt}\}]\\
+&\quad \text{response} \gets \text{config.provider.chat}(\text{messages})\\
+&\\
+&\quad \textbf{if } \text{response} = \text{Err}(e) \textbf{ then}\\
+&\quad\quad \textbf{return } \{\\
+&\quad\quad\quad \text{contentType}: \text{"unknown"},\\
+&\quad\quad\quad \text{recommendedFormatId}: \text{None},\\
+&\quad\quad\quad \text{reasoning}: \text{"AI unavailable, falling back to best quality"}\\
+&\quad\quad \}\\
+&\quad \textbf{end if}\\
+&\\
+&\quad \text{parsed} \gets \text{parseJSON}(\text{response.value})\\
+&\quad \textbf{return } \{\\
+&\quad\quad \text{contentType}: \text{parsed.content\_type},\\
+&\quad\quad \text{recommendedFormatId}: \text{parsed.recommended\_format\_id},\\
+&\quad\quad \text{reasoning}: \text{parsed.reasoning}\\
+&\quad \}
+\end{aligned}
+```
+
+---
+
+### Algorithm 9: Content Analysis
+
+```math
+\begin{aligned}
+&\textbf{algorithm } \text{analyzeContent} \textbf{ is}\\
+&\quad \textbf{input}: f \in \text{DownloadedFiles},\ config \in \text{AIConfig},\ opts \in \text{DownloadOptions}\\
+&\quad \textbf{output}: r \in \text{AIAnalysisResult}\\
+&\\
+&\quad \text{result} \gets \{\text{transcription}: \text{None},\ \text{summary}: \text{None},\ \text{thumbnails}: [],\\
+&\quad\quad\quad\quad\ \ \text{contentType}: \text{None},\ \text{suggestedFormat}: \text{None}\}\\
+&\\
+&\quad \textbf{if } opts.\text{aiTranscribe} \textbf{ then}\\
+&\quad\quad \text{audio} \gets \text{ffmpeg.extractAudio}(f.\text{videoPath})\\
+&\quad\quad \text{audioChunks} \gets \text{chunkAudio}(\text{audio},\ 25\text{MB})\\
+&\quad\quad \text{transcripts} \gets []\\
+&\quad\quad \textbf{for each } \text{chunk} \in \text{audioChunks} \textbf{ do}\\
+&\quad\quad\quad \text{t} \gets \text{config.provider.transcribe}(\text{chunk})\\
+&\quad\quad\quad \text{transcripts}.append(\text{t})\\
+&\quad\quad \textbf{end for}\\
+&\quad\quad \text{result.transcription} \gets \text{mergeTranscripts}(\text{transcripts})\\
+&\quad\quad \text{writeSRT}(\text{result.transcription},\ f.\text{videoPath}.withSuffix(\text{".srt"}))\\
+&\quad \textbf{end if}\\
+&\\
+&\quad \textbf{if } opts.\text{aiSummarize} \land \text{result.transcription} \neq \text{None} \textbf{ then}\\
+&\quad\quad \text{prompt} \gets \text{"Summarize this transcript. Include key points,}\\
+&\quad\quad\quad \text{sections, and timestamps. Format as markdown."}\\
+&\quad\quad \text{messages} \gets [\{\text{role}: \text{"user"},\ \text{content}: \text{prompt} \cup \text{result.transcription}\}]\\
+&\quad\quad \text{result.summary} \gets \text{config.provider.chat}(\text{messages})\\
+&\quad \textbf{end if}\\
+&\\
+&\quad \textbf{if } opts.\text{aiThumbnails} \textbf{ then}\\
+&\quad\quad \text{frames} \gets \text{ffmpeg.extractFrames}(f.\text{videoPath},\ \text{interval}=10\text{s})\\
+&\quad\quad \textbf{if } |\text{frames}| > 5 \textbf{ then}\\
+&\quad\quad\quad \text{prompt} \gets \text{"Select the 3 most representative frames}\\
+&\quad\quad\quad\quad \text{for a video thumbnail. Return indices."}\\
+&\quad\quad\quad \text{selected} \gets \text{config.provider.selectFrames}(\text{frames},\ \text{prompt})\\
+&\quad\quad\quad \text{result.thumbnails} \gets \text{saveThumbnails}(\text{frames}[\text{selected}])\\
+&\quad\quad \textbf{else}\\
+&\quad\quad\quad \text{result.thumbnails} \gets \text{saveThumbnails}(\text{frames}[:3])\\
+&\quad\quad \textbf{end if}\\
+&\quad \textbf{end if}\\
+&\\
+&\quad \textbf{return } \text{result}
+\end{aligned}
+```
+
 ## Key Functions with Formal Specifications
 
 ### Function 1: `extract(url)`
@@ -769,6 +1169,56 @@ Persisted state enabling interrupted downloads to continue.
 - Returned path has no illegal filesystem characters
 - Returned path is unique within the output directory
 
+---
+
+### Function 6: `extractAI(url, source, config)`
+
+```math
+\text{extractAI} : \text{URL} \times \text{String} \times \text{AIConfig} \rightarrow \text{Result}(\text{MediaManifest}, \text{ExtractionError})
+```
+
+**Preconditions**:
+- $url$ is a syntactically valid URL
+- `config.provider` is reachable and authenticated
+- `source` is the full HTML or rendered DOM of the page at $url$
+
+**Postconditions**:
+- $\text{Ok}(m) \Rightarrow m.\text{formats} \neq \emptyset \land \forall f \in m.\text{formats}.\ \text{\_looks\_like\_media}(f.\text{url})$
+- $\text{Err}(e) \Rightarrow e \in \{\text{NetworkError}, \text{AIFailure}, \text{ParseError}\}$
+
+---
+
+### Function 7: `adviseQuality(manifest, config)`
+
+```math
+\text{adviseQuality} : \text{MediaManifest} \times \text{AIConfig} \rightarrow \text{AIQualityAdvice}
+```
+
+**Preconditions**:
+- $manifest.\text{formats} \neq \emptyset$
+- `config.provider` is reachable
+
+**Postconditions**:
+- Always returns a valid `AIQualityAdvice` (never raises — falls back to "unknown" on failure)
+- $\text{advice.content\_type} \in \{\text{"lecture"}, \text{"music\_video"}, \text{"podcast"}, \text{"short\_clip"}, \text{"archival"}, \text{"unknown"}\}$
+
+---
+
+### Function 8: `analyzeContent(files, config, opts)`
+
+```math
+\text{analyzeContent} : \text{DownloadedFiles} \times \text{AIConfig} \times \text{DownloadOptions} \rightarrow \text{AIAnalysisResult}
+```
+
+**Preconditions**:
+- `files` contains at least one valid downloaded file
+- At least one of `opts.aiTranscribe`, `opts.aiSummarize`, `opts.aiThumbnails` is $\top$
+
+**Postconditions**:
+- Always returns a valid `AIAnalysisResult` (partial results on individual mode failures)
+- $\text{result.transcription} \neq \text{None} \Rightarrow \text{validSRTFormat}(\text{result.transcription})$
+- $\text{result.thumbnails} \neq [] \Rightarrow \forall p \in \text{result.thumbnails}.\ \text{fileExists}(p)$
+
 ## Example Usage
 
 ```math
@@ -801,6 +1251,29 @@ Persisted state enabling interrupted downloads to continue.
 &\textbf{// JS-rendered page}\\
 &\textbf{let } opts_js = opts \cup \{ \text{jsRender}: \top \}\\
 &\textbf{let } r_js = \text{orchestrator.download}(u_{\text{spa}}, opts_js)
+\end{aligned}
+```
+
+```math
+\begin{aligned}
+&\textbf{// AI-assisted extraction (obfuscated pages)}\\
+&\textbf{let } opts_{ai} = opts \cup \{ \text{aiExtract}: \top \}\\
+&\textbf{let } r_{ai} = \text{orchestrator.download}(u_{\text{obfuscated}}, opts_{ai})\\
+&\textbf{// Falls back to LLM-based URL extraction on ExtractionFailed}\\
+&\\
+&\textbf{// Content-aware quality selection}\\
+&\textbf{let } opts_{cq} = opts \cup \{ \text{quality}: \text{AIRecommended},\ \text{aiQuality}: \top \}\\
+&\textbf{let } r_{cq} = \text{orchestrator.download}(u, opts_{cq})\\
+&\textbf{// LLM classifies content type and recommends format}\\
+&\\
+&\textbf{// Full content analysis}\\
+&\textbf{let } opts_{an} = opts \cup \{\\
+&\quad \text{aiAnalyze}: \top,\ \text{aiTranscribe}: \top,\ \text{aiSummarize}: \top,\ \text{aiThumbnails}: \top\\
+&\}\\
+&\textbf{let } r_{an} = \text{orchestrator.download}(u, opts_{an})\\
+&\textbf{// r\_{an}.analysis.transcription contains SRT text}\\
+&\textbf{// r\_{an}.analysis.summary contains markdown summary}\\
+&\textbf{// r\_{an}.analysis.thumbnails contains list of JPEG paths}\\
 \end{aligned}
 ```
 
@@ -838,7 +1311,22 @@ Persisted state enabling interrupted downloads to continue.
 &\quad \text{resolve}(t, m).\text{filename} \text{ contains no illegal filesystem characters}\\
 &\\
 &\textbf{P9 (Rate Limit Respect):}\\
-&\quad opts.\text{rateLimit} = \text{Some}(r) \Rightarrow \text{avgThroughput}(\text{download}) \leq r \text{ bytes/sec}
+&\quad opts.\text{rateLimit} = \text{Some}(r) \Rightarrow \text{avgThroughput}(\text{download}) \leq r \text{ bytes/sec}\\
+&\\
+&\textbf{P10 (AI Extraction Fallback):}\\
+&\quad \text{If standard extraction fails and } opts.\text{aiExtract} = \top,\\
+&\quad \text{AI extraction is attempted; if AI also fails, the original error is propagated.}\\
+&\quad \text{The pipeline never silently succeeds with an empty manifest.}\\
+&\\
+&\textbf{P11 (Graceful Degradation):}\\
+&\quad \text{If any AI feature fails (provider unreachable, unparseable response),}\\
+&\quad \text{the pipeline continues without AI analysis — the download still completes.}\\
+&\quad \text{Partial AI results are returned when some modes succeed and others fail.}\\
+&\\
+&\textbf{P12 (Provider Agnosticism):}\\
+&\quad \text{All AI features produce identical results regardless of which provider is used,}\\
+&\quad \text{given the same input and model capabilities. Provider choice affects latency}\\
+&\quad \text{and cost, not correctness.}
 \end{aligned}
 ```
 
@@ -906,6 +1394,46 @@ Persisted state enabling interrupted downloads to continue.
 **Response**: Return `Err(NetworkError(url, "Timeout..."))` via the browser close path.
 **Recovery**: Retry with `--retries`, or the page may require a different extraction strategy (e.g., direct API URL).
 
+---
+
+### Error Scenario 9: AI Provider Not Configured
+
+**Condition**: An AI flag (`--ai-extract`, `--ai-quality`, `--ai-analyze`, etc.) is used but no AI provider is configured (missing `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or Ollama not running).
+**Response**: Return `Err(AIConfigError("No AI provider configured. Set OPENAI_API_KEY, ANTHHROPIC_API_KEY, or start Ollama."))`.
+**Recovery**: Set the appropriate environment variable, pass `--ai-api-key`, or start a local Ollama instance.
+
+---
+
+### Error Scenario 10: AI Provider Unreachable
+
+**Condition**: The configured AI provider's API endpoint is unreachable, returns 429 (rate limit), or 503 (service unavailable).
+**Response**: Retry with exponential backoff (initial delay 1s, max 3 attempts). If all retries fail, fall back to non-AI path with a warning logged. For AIExtractor: propagate `ExtractionError`. For ContentAnalyzer: return partial `AIAnalysisResult`.
+**Recovery**: Check network connectivity, try a different provider, wait for rate limit reset, or omit AI flags.
+
+---
+
+### Error Scenario 11: AI Response Unparseable
+
+**Condition**: The LLM returns a response that cannot be parsed as the expected JSON structure (malformed JSON, missing required fields, invalid URL patterns).
+**Response**: Log warning with the raw response snippet. Skip the failed AI feature — for AIExtractor: return `Err(ParseError)`. For ContentAnalyzer: set the failed field to `None`, continue with other analysis modes.
+**Recovery**: Try a different model with better structured output support, simplify the prompt, or omit AI flags.
+
+---
+
+### Error Scenario 12: AI Quota Exceeded
+
+**Condition**: The provider API returns a quota/credit exceeded error (e.g., OpenAI 402, Anthropic 403 with quota message).
+**Response**: Return `Err(AIQuotaExceeded("Provider quota exhausted. Consider switching to Ollama for local inference."))`. Log the error with the provider name.
+**Recovery**: Add credits to the provider account, switch to Ollama (local, no quota), or omit AI flags.
+
+---
+
+### Error Scenario 13: Transcription Failure
+
+**Condition**: Audio extraction from video fails (corrupt file, unsupported codec) or the STT endpoint rejects the audio (file too large, unsupported format).
+**Response**: Return partial `AIAnalysisResult` with `transcription = None`. The downloaded file is preserved. Log warning with the specific failure reason.
+**Recovery**: Check audio codec compatibility, try a different STT provider, or convert audio to a supported format (e.g., 16kHz WAV) before retrying.
+
 ## Testing Strategy
 
 ### Unit Testing Approach
@@ -917,6 +1445,10 @@ Each component is tested in isolation with mocked dependencies:
 - **FormatSelector**: Test all `QualitySpec` variants, audio-only mode, mux decision, empty format list edge case.
 - **OutputPathResolver**: Test template substitution, illegal character sanitization, collision avoidance.
 - **ResumeState persistence**: Test read/write/clear of resume state records.
+- **AIProvider**: Mock HTTP responses for each provider (OpenAI, Anthropic, Ollama). Verify correct API request format, auth header, model parameter. Test retry logic on 429/503 responses.
+- **AIExtractor**: Mock LLM response with known media URLs. Verify URL extraction, normalization, deduplication. Test error path on unparseable LLM response. Test graceful fallback when no valid URLs found.
+- **ContentAnalyzer**: Mock STT and chat responses. Verify transcription, summarization, and thumbnail extraction paths independently. Test graceful degradation when individual modes fail.
+- **QualityAdvisor**: Mock LLM classification response. Verify content type detection, format recommendation. Test fallback to `Best` quality spec when LLM fails.
 
 Coverage goal: ≥ 90% branch coverage on core logic modules.
 
@@ -945,6 +1477,7 @@ Key properties to generate:
 - **Resume integration test**: Kill the download at 50% bytes; restart; verify final file equals full file.
 - **Batch download test**: Download 3 URLs concurrently; verify all succeed independently.
 - **FFmpeg mux test**: Supply pre-downloaded separate video and audio fragments; verify muxed output is a valid container.
+- **AI integration test**: Mock provider returns known media URLs; verify full pipeline produces correct file. Test AI fallback: standard extractor fails, AI extractor succeeds. Test content analysis: verify transcription, summary, and thumbnails are produced.
 
 ## Performance Considerations
 
@@ -952,6 +1485,10 @@ Key properties to generate:
 - **Rate limiting**: A token-bucket implementation caps throughput to `opts.rateLimit` bytes/sec across all concurrent fragment downloads, not per-fragment.
 - **Memory usage**: Chunks are written directly to disk; no full file is buffered in memory. Chunk size defaults to 1 MB.
 - **Extractor caching**: Extracted `MediaManifest` results can be cached in-process (TTL: 60 s) to avoid redundant page fetches when retrying format selection.
+- **AI latency**: LLM calls add 1-10s latency per request. AI features are opt-in (`--ai-extract`, `--ai-quality`, `--ai-analyze`) to avoid impacting default performance.
+- **AI response caching**: AI analysis results for the same URL are cached in-process (TTL: 300 s) to avoid redundant API calls when retrying or re-analyzing.
+- **Local vs cloud providers**: Ollama (local) avoids network latency but requires GPU/RAM. Cloud providers (OpenAI, Anthropic) add network round-trip but no local resource usage.
+- **Transcription chunking**: Large audio files are chunked into 25 MB segments to respect STT API size limits. Chunks are processed sequentially to avoid rate limits.
 
 ## Security Considerations
 
@@ -961,6 +1498,10 @@ Key properties to generate:
 - **TLS verification**: HTTPS certificate verification is enabled by default. A `--no-check-certificate` flag may be exposed for development use only, with a visible warning.
 - **Cookie / credential handling**: If platform authentication requires cookies, they are read from a file (never logged or serialized into error messages). Credential values are never printed in progress output.
 - **Redirect limits**: HTTP redirects are followed up to a configurable maximum (default: 10) to prevent redirect loops.
+- **AI data exposure**: When using `--ai-extract`, page source HTML is sent to the configured LLM provider. When using `--transcribe`, audio content is sent. Users should be aware of privacy implications before enabling AI features on sensitive content.
+- **AI API key protection**: AI API keys are never logged, displayed in progress output, or written to error messages. They are read from environment variables (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`) or `--ai-api-key` flag only.
+- **Prompt injection mitigation**: AI prompts include user-provided metadata (title, description). Output from the LLM is validated before use — URLs are checked against `_looks_like_media()` predicates, JSON is schema-validated, and no LLM output is executed as code.
+- **Local provider privacy advantage**: Ollama processes all data entirely on the user's machine — no content or metadata leaves the system. Recommended for privacy-sensitive use cases.
 
 ## Dependencies
 
@@ -974,3 +1515,7 @@ Key properties to generate:
 | Progress reporter | Emitting download progress events (bytes, ETA, speed) |
 | CLI argument parser | Parsing command-line flags and options |
 | Playwright | Headless browser automation for JS-rendered page extraction |
+| openai | OpenAI API client (optional, for OpenAI AI provider) |
+| anthropic | Anthropic API client (optional, for Anthropic AI provider) |
+| ollama | Ollama client (optional, for local AI provider) |
+| faster-whisper | Local speech-to-text engine (optional, alternative to cloud STT APIs) |
