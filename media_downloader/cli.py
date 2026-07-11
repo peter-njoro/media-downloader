@@ -23,7 +23,8 @@ from media_downloader.progress import ConsoleProgressReporter
 @click.option("--retries", type=int, default=3)
 @click.option("--resume/--no-resume", default=True)
 @click.option("--concurrent-fragments", type=int, default=1)
-def main(url: str, quality: str, audio_only: bool, audio_format: Optional[str], output_template: str, output_dir: Path, rate_limit: Optional[int], retries: int, resume: bool, concurrent_fragments: int) -> None:
+@click.option("--js", is_flag=True, help="Use a headless browser to render JavaScript before extracting media")
+def main(url: str, quality: str, audio_only: bool, audio_format: Optional[str], output_template: str, output_dir: Path, rate_limit: Optional[int], retries: int, resume: bool, concurrent_fragments: int, js: bool) -> None:
     opts = DownloadOptions(
         quality=_parse_quality(quality),
         audio_only=audio_only,
@@ -34,6 +35,7 @@ def main(url: str, quality: str, audio_only: bool, audio_format: Optional[str], 
         retries=retries,
         resume=resume,
         concurrent_fragments=concurrent_fragments,
+        js_render=js,
     )
     try:
         result = create_orchestrator().download(url, opts, progress_reporter=ConsoleProgressReporter())

@@ -5,7 +5,7 @@
 
 The media downloader is a CLI tool and reusable library for downloading video and audio files from internet sources (web pages, streaming platforms, direct media URLs). Given a URL, the tool identifies the media host, extracts available media streams and formats, selects the best match against user-specified quality constraints, downloads the stream(s), optionally merges video and audio tracks, and writes the final file to disk. The system is designed to be extensible: new platform extractors can be added without changing core download or merge logic.
 
-The tool exposes both a command-line interface for end users and a programmatic API for integration into other applications. It supports resuming interrupted downloads, progress reporting, format selection, post-processing (audio extraction, remuxing), and configurable output naming. In addition to direct media URLs, the default extractor pipeline now includes a lightweight web scraper for static HTML pages that surfaces media links embedded in the page.
+The tool exposes both a command-line interface for end users and a programmatic API for integration into other applications. It supports resuming interrupted downloads, progress reporting, format selection, post-processing (audio extraction, remuxing), and configurable output naming. In addition to direct media URLs, the default extractor pipeline includes a lightweight web scraper for static HTML pages that surfaces media links embedded in the page. For JavaScript-heavy pages where media is loaded dynamically, an optional Playwright-based extractor can render the page in a headless browser and discover media through both DOM inspection and network request interception.
 
 ## Architecture
 
@@ -16,6 +16,7 @@ graph TD
 
     Core --> ER[Extractor Registry]
     ER --> EX1[Web Page Scraper]
+    ER --> EX1B[Web Page JS Extractor]
     ER --> EX2[Generic HTTP Extractor]
     ER --> EXN[Platform-specific Extractors]
 
@@ -32,6 +33,8 @@ graph TD
     PP --> AC[Audio Converter]
 
     FS --> FM[Format Manifest]
+
+    EX1B --> PB[Playwright / Headless Browser]
 ```
 
 ## Sequence Diagrams
@@ -83,6 +86,36 @@ sequenceDiagram
         DownloadManager->>ProgressReporter: emit(currentOffset, totalSize)
     end
     DownloadManager->>ResumeStore: clearResumeState(url)
+```
+
+### JS-Assisted Extraction Flow
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Orchestrator
+    participant JSExtractor
+    participant Playwright
+    participant Browser
+    participant Page
+
+    User->>Orchestrator: download(url, opts{js_render: true})
+    Orchestrator->>JSExtractor: extract(url)
+    JSExtractor->>Playwright: sync_playwright()
+    Playwright->>Browser: chromium.launch(headless=True)
+    Browser->>Page: new_page()
+    JSExtractor->>Page: on("response", handler)
+    JSExtractor->>Page: goto(url, wait_until="networkidle")
+    loop Each HTTP response
+        Page-->>JSExtractor: response event (URL check)
+        JSExtractor->>JSExtractor: record media URLs
+    end
+    JSExtractor->>Page: evaluate(DOM query script)
+    Page-->>JSExtractor: DOM media element URLs
+    JSExtractor->>Page: evaluate(meta query script)
+    Page-->>JSExtractor: title, description, thumbnail
+    JSExtractor->>JSExtractor: merge + deduplicate URLs
+    JSExtractor-->>Orchestrator: MediaManifest
 ```
 
 ## Components and Interfaces
@@ -151,6 +184,49 @@ The default implementation now includes a `WebPageExtractor` for static HTML pag
 - Determine if a URL belongs to its platform (pattern matching)
 - Fetch and parse the page or platform API
 - Build and return a `MediaManifest` with all format streams
+
+---
+
+### Component 3b: Web Page JS Extractor
+
+**Purpose**: Extracts media from JavaScript-rendered pages using a headless browser. Unlike the static `WebPageExtractor`, this component can discover media loaded dynamically via XHR/fetch/AJAX that never appears in the initial HTML.
+
+This extractor is **never** auto-selected by the `ExtractorRegistry` — its `canHandle` always returns `False`. It is invoked directly by the orchestrator when the user passes `--js`. It uses two complementary strategies:
+
+1. **DOM inspection** – queries the rendered DOM for `<video>`, `<audio>`, `<source>`, and `<img>` elements using JavaScript evaluation.
+2. **Network interception** – listens to all HTTP responses made by the page and records URLs matching known media extensions (`.mp4`, `.m3u8`, `.mpd`, `.ts`, etc.).
+
+Both sources are merged, deduplicated, and normalized into a `MediaManifest`.
+
+**Interface**:
+```math
+\begin{aligned}
+&\text{WebPageJSExtractor} : \{\\
+&\quad \text{canHandle} : \text{URL} \rightarrow \mathbb{B} \quad \text{(always } \bot\text{)}\\
+&\quad \text{extract} : \text{URL} \rightarrow \text{Result}(\text{MediaManifest}, \text{ExtractionError})\\
+&\}
+\end{aligned}
+```
+
+**Responsibilities**:
+- Launch a headless Chromium browser via Playwright
+- Register a response listener before page navigation to capture all network requests
+- Navigate to the target URL and wait for `networkidle` (no more than 30 s)
+- Query the rendered DOM for media element `src`/`poster` attributes
+- Parse `<title>` and OpenGraph meta tags for metadata
+- Merge DOM-found and network-intercepted URLs, deduplicate, and filter to known media extensions
+- Clean up the browser instance on completion or error
+
+**Additional supported extensions** (beyond the static extractor):
+- `.ts` — MPEG transport stream segments
+- `.mpd` — DASH manifest
+
+**Registration order**:
+```
+WebPageExtractor       (static, fast, default)
+WebPageJSExtractor     (JS-capable, opt-in via --js, skipped by registry.resolve)
+GenericHTTPExtractor   (direct media URLs)
+```
 
 ---
 
@@ -305,7 +381,8 @@ User-supplied configuration for a download request.
 &\quad \text{rateLimit} : \text{Option}(\mathbb{N}), \quad \text{// bytes/sec}\\
 &\quad \text{retries} : \mathbb{N},\\
 &\quad \text{resume} : \mathbb{B},\\
-&\quad \text{concurrentFragments} : \mathbb{N}\\
+&\quad \text{concurrentFragments} : \mathbb{N},\\
+&\quad \text{jsRender} : \mathbb{B} \quad \text{// use Playwright for JS-rendered pages}\\
 &\}
 \end{aligned}
 ```
@@ -377,8 +454,12 @@ Persisted state enabling interrupted downloads to continue.
 &\quad \textbf{precondition}: u \neq \emptyset \land \text{isValidURL}(u)\\
 &\quad \textbf{postcondition}: r = \text{Ok}(d) \Rightarrow \text{fileExists}(d.\text{finalPath}) \land d.\text{bytesDownloaded} > 0\\
 &\\
-&\quad \text{extractor} \gets \text{registry.resolve}(u)\\
-&\quad \textbf{if } \text{extractor} = \emptyset \textbf{ then return } \text{Err}(\text{NoExtractorFound}(u))\\
+&\quad \textbf{if } opts.\text{jsRender} \textbf{ then}\\
+&\quad\quad \text{extractor} \gets \text{WebPageJSExtractor()}\\
+&\quad \textbf{else}\\
+&\quad\quad \text{extractor} \gets \text{registry.resolve}(u)\\
+&\quad\quad \textbf{if } \text{extractor} = \emptyset \textbf{ then return } \text{Err}(\text{NoExtractorFound}(u))\\
+&\quad \textbf{end if}\\
 &\\
 &\quad \text{manifest} \gets \text{extractor.extract}(u)\\
 &\quad \textbf{if } \text{manifest} = \text{Err}(e) \textbf{ then return } \text{Err}(\text{ExtractionFailed}(e))\\
@@ -535,7 +616,53 @@ Persisted state enabling interrupted downloads to continue.
 
 ---
 
-### Algorithm 5: Format Quality Scoring
+### Algorithm 5: JS-Assisted Media Extraction
+
+```math
+\begin{aligned}
+&\textbf{algorithm } \text{extractJS} \textbf{ is}\\
+&\quad \textbf{input}: u \in \text{URL}\\
+&\quad \textbf{output}: m \in \text{Result}(\text{MediaManifest}, \text{ExtractionError})\\
+&\quad \textbf{precondition}: u \neq \emptyset \land \text{Playwright available}\\
+&\quad \textbf{postcondition}: m = \text{Ok}(\hat{m}) \Rightarrow |\hat{m}.\text{formats}| \geq 1\\
+&\\
+&\quad \text{pw} \gets \text{sync\_playwright()}\\
+&\quad \text{browser} \gets \text{pw.chromium.launch}(\text{headless}: \top)\\
+&\quad \text{page} \gets \text{browser.newPage()}\\
+&\\
+&\quad \text{networkUrls} \gets \emptyset\\
+&\quad \text{page.on}(\text{"response"},\ \lambda\ r.\ \text{if } \text{isMediaURL}(r.\text{url}) \text{ then } \text{networkUrls} \gets \text{networkUrls} \cup \{r.\text{url}\})\\
+&\\
+&\quad \text{page.goto}(u,\ \text{waitUntil}: \text{"networkidle"},\ \text{timeout}: 30000)\\
+&\\
+&\quad \text{domUrls} \gets \text{page.evaluate}(\text{DOM query script})\\
+&\quad \text{title} \gets \text{page.title()}\\
+&\quad \text{meta} \gets \text{page.evaluate}(\text{Meta query script})\\
+&\\
+&\quad \text{browser.close()}\\
+&\\
+&\quad \text{allRaw} \gets \text{domUrls} \cup \text{networkUrls}\\
+&\quad \text{candidates} \gets \text{normalizeAndFilter}(u,\ \text{allRaw})\\
+&\quad \textbf{if } \text{candidates} = \emptyset \textbf{ then return } \text{Err}(\text{NoMediaFound}(u))\\
+&\\
+&\quad \textbf{return } \text{Ok}(\text{buildManifest}(u,\ \text{candidates},\ \text{title},\ \text{meta}))
+\end{aligned}
+```
+
+**Preconditions**:
+- Playwright is installed and browser binaries are available
+- The target URL is reachable
+
+**Postconditions**:
+- On success: manifest contains at least one format
+- Browser process is terminated regardless of success/failure
+
+**Network Interception Invariant**:
+- The response listener is registered *before* `page.goto()` to ensure no media responses are missed during initial page load.
+
+---
+
+### Algorithm 6: Format Quality Scoring
 
 ```math
 \begin{aligned}
@@ -669,7 +796,11 @@ Persisted state enabling interrupted downloads to continue.
 &\textbf{// Batch download}\\
 &\textbf{let } urls = [u_1, u_2, u_3]\\
 &\textbf{let } results = \text{orchestrator.downloadBatch}(urls, opts)\\
-&\forall i,\ results[i] = \text{Ok}(\cdot) \lor results[i] = \text{Err}(\cdot) \quad \textbf{// each independent}
+&\forall i,\ results[i] = \text{Ok}(\cdot) \lor results[i] = \text{Err}(\cdot) \quad \textbf{// each independent}\\
+&\\
+&\textbf{// JS-rendered page}\\
+&\textbf{let } opts_js = opts \cup \{ \text{jsRender}: \top \}\\
+&\textbf{let } r_js = \text{orchestrator.download}(u_{\text{spa}}, opts_js)
 \end{aligned}
 ```
 
@@ -759,6 +890,22 @@ Persisted state enabling interrupted downloads to continue.
 **Response**: Close the file, return `Err(DiskFull(path))`.
 **Recovery**: The `.part` file is kept; the user can free space and resume the download.
 
+---
+
+### Error Scenario 7: Browser Launch Failure (JS Extractor)
+
+**Condition**: Playwright cannot launch the headless browser (missing browser binaries, insufficient memory, sandbox restrictions).
+**Response**: Return `Err(ExtractionFailed("playwright is required for JS rendering..."))` with installation instructions.
+**Recovery**: User should run `playwright install` to download browser binaries, or fall back to the static extractor (omit `--js`).
+
+---
+
+### Error Scenario 8: Page Navigation Timeout (JS Extractor)
+
+**Condition**: The target page does not reach `networkidle` within 30 seconds (e.g., infinite-polling SPAs, WebSocket-heavy pages).
+**Response**: Return `Err(NetworkError(url, "Timeout..."))` via the browser close path.
+**Recovery**: Retry with `--retries`, or the page may require a different extraction strategy (e.g., direct API URL).
+
 ## Testing Strategy
 
 ### Unit Testing Approach
@@ -766,6 +913,7 @@ Persisted state enabling interrupted downloads to continue.
 Each component is tested in isolation with mocked dependencies:
 
 - **ExtractorRegistry**: Verify correct extractor is returned for known URL patterns; verify `None` for unrecognized URLs.
+- **WebPageJSExtractor**: Mock Playwright browser, page, and response objects. Test DOM extraction, network interception, URL deduplication, relative URL resolution, metadata extraction, and no-media error path.
 - **FormatSelector**: Test all `QualitySpec` variants, audio-only mode, mux decision, empty format list edge case.
 - **OutputPathResolver**: Test template substitution, illegal character sanitization, collision avoidance.
 - **ResumeState persistence**: Test read/write/clear of resume state records.
@@ -825,3 +973,4 @@ Key properties to generate:
 | Resume state store | Persisting byte offsets across process restarts (e.g. JSON file or SQLite) |
 | Progress reporter | Emitting download progress events (bytes, ETA, speed) |
 | CLI argument parser | Parsing command-line flags and options |
+| Playwright | Headless browser automation for JS-rendered page extraction |

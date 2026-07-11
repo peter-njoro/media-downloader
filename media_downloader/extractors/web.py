@@ -141,11 +141,19 @@ class WebPageExtractor(Extractor):
         return normalized
 
     @classmethod
+    def _strip_url_trailing_tokens(cls, url: str) -> str:
+        """Strip query string and/or fragment from *url* for extension matching."""
+        url = url.split("#", 1)[0]
+        url = url.split("?", 1)[0]
+        return url
+
+    @classmethod
     def _looks_like_media(cls, url: str) -> bool:
         lower_url = url.lower()
-        return any(lower_url.endswith(ext) for ext in cls._MEDIA_EXTENSIONS) or any(
-            lower_url.rsplit("?", 1)[0].endswith(ext) for ext in cls._MEDIA_EXTENSIONS
-        )
+        if any(lower_url.endswith(ext) for ext in cls._MEDIA_EXTENSIONS):
+            return True
+        stripped = cls._strip_url_trailing_tokens(lower_url)
+        return any(stripped.endswith(ext) for ext in cls._MEDIA_EXTENSIONS)
 
     @classmethod
     def _looks_like_html_page(cls, url: str) -> bool:

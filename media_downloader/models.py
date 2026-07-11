@@ -127,6 +127,7 @@ class DownloadOptions:
     retries: int = 3
     resume: bool = True
     concurrent_fragments: int = 1
+    js_render: bool = False
 
 
 @dataclass

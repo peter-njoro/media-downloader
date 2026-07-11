@@ -8,6 +8,7 @@ from typing import Callable, List, Optional
 
 from media_downloader.download_manager import DownloadManager
 from media_downloader.extractors.web import WebPageExtractor
+from media_downloader.extractors.web_js import WebPageJSExtractor
 from media_downloader.format_selector import FormatSelector
 from media_downloader.models import (
     DownloadError,
@@ -48,9 +49,12 @@ class Orchestrator:
         opts: DownloadOptions,
         progress_reporter: Optional[ProgressReporter] = None,
     ) -> DownloadResult:
-        extractor = self._registry.resolve(url)
-        if extractor is None:
-            raise NoExtractorFound(url)
+        if opts.js_render:
+            extractor = WebPageJSExtractor()
+        else:
+            extractor = self._registry.resolve(url)
+            if extractor is None:
+                raise NoExtractorFound(url)
 
         manifest = extractor.extract(url)
         selected = self._selector.select(manifest, opts)
@@ -76,5 +80,6 @@ class Orchestrator:
 def create_orchestrator() -> Orchestrator:
     registry = ExtractorRegistry()
     registry.register(WebPageExtractor())
+    registry.register(WebPageJSExtractor())
     registry.register(GenericHTTPExtractor())
     return Orchestrator(registry=registry)
