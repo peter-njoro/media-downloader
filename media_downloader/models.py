@@ -60,6 +60,11 @@ class FormatId(QualitySpec):
     value: str  # exact format_id to select
 
 
+@dataclass(frozen=True)
+class AIRecommended(QualitySpec):
+    """Let the AI advisor select the optimal format for the content type."""
+
+
 # ---------------------------------------------------------------------------
 # Core media models
 # ---------------------------------------------------------------------------
@@ -128,6 +133,12 @@ class DownloadOptions:
     resume: bool = True
     concurrent_fragments: int = 1
     js_render: bool = False
+    ai_extract: bool = False
+    ai_quality: bool = False
+    ai_analyze: bool = False
+    ai_transcribe: bool = False
+    ai_summarize: bool = False
+    ai_thumbnails: bool = False
 
 
 @dataclass
@@ -157,6 +168,43 @@ class SelectedFormats:
             raise ValueError(
                 "SelectedFormats must have at least one of video or audio set"
             )
+
+
+# ---------------------------------------------------------------------------
+# AI models
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class AIConfig:
+    """Configuration for connecting to an AI provider."""
+
+    provider: str  # "openai" | "anthropic" | "ollama"
+    model: Optional[str] = None
+    api_key: Optional[str] = None
+    base_url: Optional[str] = None
+    max_tokens: int = 4096
+    temperature: float = 0.3
+
+
+@dataclass
+class AIAnalysisResult:
+    """Results from AI content analysis. Each field is optional."""
+
+    transcription: Optional[str] = None      # SRT-formatted captions
+    summary: Optional[str] = None            # markdown summary
+    thumbnails: List[Path] = field(default_factory=list)
+    content_type: Optional[str] = None       # e.g. "lecture", "music_video"
+    suggested_format: Optional[str] = None   # recommended format ID
+
+
+@dataclass
+class AIQualityAdvice:
+    """Internal result from the Quality Advisor."""
+
+    content_type: str
+    recommended_format_id: Optional[str] = None
+    reasoning: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -201,6 +249,7 @@ class DownloadResult:
     selected_formats: SelectedFormats
     bytes_downloaded: int
     duration_ms: int
+    analysis: Optional[AIAnalysisResult] = None
 
 
 @dataclass
@@ -322,3 +371,15 @@ class ProcessingFailed(ProcessingError):
     def __init__(self, ffmpeg_stderr: str) -> None:
         super().__init__(f"FFmpeg processing failed:\n{ffmpeg_stderr}")
         self.ffmpeg_stderr = ffmpeg_stderr
+
+
+class AIConfigError(DownloadError):
+    """AI provider is not configured or configuration is invalid."""
+
+
+class AIFailure(ExtractionError):
+    """The AI provider returned an error or unusable response."""
+
+
+class AIQuotaExceeded(DownloadError):
+    """The AI provider's quota or credit has been exhausted."""

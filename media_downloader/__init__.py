@@ -3,6 +3,7 @@ media_downloader — CLI tool and reusable library for downloading video/audio.
 
 Public API surface (expanded as components are implemented):
     - models: all data classes and error types
+    - ai_provider: AI provider abstraction
 """
 
 from media_downloader.extractors.generic import GenericHTTPExtractor
@@ -15,6 +16,7 @@ from media_downloader.models import (
     Worst,
     Height,
     FormatId,
+    AIRecommended,
     # Core data models
     Format,
     MediaManifest,
@@ -26,6 +28,10 @@ from media_downloader.models import (
     DownloadResult,
     ResumeState,
     PostProcessOptions,
+    # AI models
+    AIConfig,
+    AIAnalysisResult,
+    AIQualityAdvice,
     # Error hierarchy
     DownloadError,
     ExtractionError,
@@ -38,8 +44,12 @@ from media_downloader.models import (
     NoSuitableFormatFound,
     FormatIdNotFound,
     ProcessingFailed,
+    AIConfigError,
+    AIFailure,
+    AIQuotaExceeded,
 )
 from media_downloader.orchestrator import Orchestrator, create_orchestrator
+from media_downloader.ai_provider import AIProvider, create_provider
 
 __all__ = [
     "StreamType",
@@ -48,6 +58,7 @@ __all__ = [
     "Worst",
     "Height",
     "FormatId",
+    "AIRecommended",
     "Format",
     "MediaManifest",
     "DownloadOptions",
@@ -58,6 +69,9 @@ __all__ = [
     "DownloadResult",
     "ResumeState",
     "PostProcessOptions",
+    "AIConfig",
+    "AIAnalysisResult",
+    "AIQualityAdvice",
     "DownloadError",
     "ExtractionError",
     "SelectionError",
@@ -69,8 +83,13 @@ __all__ = [
     "NoSuitableFormatFound",
     "FormatIdNotFound",
     "ProcessingFailed",
+    "AIConfigError",
+    "AIFailure",
+    "AIQuotaExceeded",
     "GenericHTTPExtractor",
     "WebPageExtractor",
     "Orchestrator",
     "create_orchestrator",
+    "AIProvider",
+    "create_provider",
 ]

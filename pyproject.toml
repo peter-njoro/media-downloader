@@ -16,6 +16,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+ai-openai = ["httpx>=0.27"]
+ai-anthropic = ["httpx>=0.27"]
+ai-ollama = ["httpx>=0.27"]
+ai = ["httpx>=0.27"]
 dev = [
     "pytest==8.3.3",
     "hypothesis==6.112.2",
